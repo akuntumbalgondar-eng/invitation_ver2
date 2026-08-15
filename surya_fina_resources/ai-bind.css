@@ -1,0 +1,4 @@
+/* AUTO-GENERATED v2: derivasi palet (chroma-aware, ink excluded, netral dibiarkan) + shade rules. Aktif cuma pas html.chara-ai-on. */
+html.chara-ai-on{
+  --dd-mustard:color-mix(in srgb, var(--dd-red) 84%, #fff);
+}

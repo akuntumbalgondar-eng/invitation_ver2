@@ -1,0 +1,403 @@
+/**
+ * preview-mode.js — Frontend interceptor untuk live preview tema (anonymous flow).
+ *
+ * Detect preview mode via URL params (preview_bride / preview_groom). Kalo aktif:
+ *   1. Monkey-patch window.fetch — intercept calls ke guest_handler.php endpoints
+ *      (submit_rsvp, submit_kontribusi, submit_ucapan, get_guest_data, dll).
+ *      Auto-respond success dgn delay simulasi (300ms) — user ngerasa interaksinya
+ *      bener-bener jalan tanpa save ke DB real.
+ *   2. Show one-time toast: "Mode preview · aksi disimulasi"
+ *
+ * Loaded conditionally by theme files: <?php if ($isPreview): ?> <script>...</script> <?php endif; ?>
+ */
+(function () {
+    'use strict';
+
+    var params = new URLSearchParams(window.location.search);
+    var isPreview = params.has('preview_bride') || params.has('preview_groom');
+    if (!isPreview) return;
+
+    // Endpoints / actions yg di-intercept
+    var INTERCEPT_URL_PATTERNS = [
+        'guest_handler.php',
+        'rsvp_handler',
+        'kontribusi',
+        'submit_ucapan',
+        'send_kado',
+    ];
+
+    // === Content moderation — mirror api/content_moderation.php ===
+    // Block profanity Indo + scam keywords + URL/phone shilling.
+    // === WORDLIST DI-GENERATE dari api/content_moderation.php — JANGAN EDIT MANUAL ===
+    // Regenerasi: php tools/generate_moderation_js.php
+    var BANNED_WORDS = [
+        'anjing','anjir','anjrit','anjg','bangsat','bgst','kontol','kntl','memek',
+        'mmk','ngentot','ngentod','ngentd','ngentt','asu','brengsek','goblok',
+        'goblog','gblk','tolol','sialan','bajingan','bjngn','jancok','jancuk','cuk',
+        'pukimak','pukimai','kampang','kimak','lonte','pelacur','sundal','bencong',
+        'banci','babi','bacot','bego','bodoh','setan','iblis','peler','pepek',
+        'jembut','pantek','taik','tahi','tai','eek','ngewe','kampret','monyet',
+        'fuck','fucking','fck','shit','sht','bitch','btch','asshole','pussy','dick',
+        'cunt','whore','slut','bastard','pinjol','pinjaman online','judi online',
+        'judi slot','slot gacor','togel','bocoran togel','agen togel','situs judi',
+        'casino online','taruhan bola','bandar bola','bandar judi','klik link',
+        'klik disini','klik di sini','transfer ke rekening','kirim pulsa',
+        'gratis pulsa','pulsa gratis','dapat uang','dapatkan uang','cuan gampang',
+        'penghasilan tambahan','cek dm','wa saya','hubungi saya di',
+    ];
+    // === END WORDLIST ===
+    var URL_PATTERN = /(https?:\/\/|www\.|t\.me\/|wa\.me\/|bit\.ly\/|tinyurl\.com|shorturl)/i;
+    var PHONE_PATTERN = /(\+?62|0)8[\d\-\s]{8,}/;
+
+    function moderateMessage(text) {
+        if (!text) return { ok: true };
+        text = String(text).trim();
+        if (text === '') return { ok: true };
+        var lower = text.toLowerCase();
+        // Leetspeak normalize: 0→o, 1→i, 3→e, 4→a, 5→s, 7→t, $→s, @→a
+        var normalized = lower
+            .replace(/0/g, 'o').replace(/1/g, 'i').replace(/3/g, 'e')
+            .replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't')
+            .replace(/\$/g, 's').replace(/@/g, 'a');
+        // Huruf diulang dilipat: "kontool" -> "kontol" (mirror server 2026-08-01)
+        var squeezed = normalized.replace(/(.)\1+/g, '$1');
+        for (var i = 0; i < BANNED_WORDS.length; i++) {
+            var word = BANNED_WORDS[i].toLowerCase();
+            var escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            var re = new RegExp('\\b' + escaped + '\\b', 'i');
+            if (re.test(normalized) || re.test(lower) || re.test(squeezed)) {
+                return { ok: false, reason: 'Pesan kamu mengandung kata yang gak diperbolehkan. Silakan ubah pesan jadi sopan ya.', matched: word };
+            }
+        }
+        if (URL_PATTERN.test(text)) {
+            return { ok: false, reason: 'Pesan tidak boleh mengandung link. Silakan hapus link dari pesan.', matched: 'URL' };
+        }
+        if (PHONE_PATTERN.test(text)) {
+            return { ok: false, reason: 'Pesan tidak boleh mencantumkan nomor telepon. Pakai fitur RSVP buat kontak.', matched: 'phone' };
+        }
+        return { ok: true };
+    }
+
+    // Action-specific dummy responses
+    var DUMMY_RESPONSES = {
+        submit_rsvp: function (payload) {
+            // Moderate notes/customGuestName
+            var modNotes = moderateMessage(payload.notes || payload.pesan || '');
+            if (!modNotes.ok) return { success: false, preview: true, message: modNotes.reason, field: 'notes' };
+            var modName = moderateMessage(payload.customGuestName || '');
+            if (!modName.ok) return { success: false, preview: true, message: 'Nama mengandung kata yang tidak diperbolehkan.', field: 'customGuestName' };
+
+            var status = payload.attendance || payload.status || 'Hadir';
+            var pax = parseInt(payload.guestCount || payload.konfirmasi_pax || 1, 10);
+            var attendsOffline = /offline|lokasi/i.test(status);
+            var resp = {
+                success: true,
+                preview: true,
+                message: 'RSVP terkirim! (mode preview — gak disimpan)',
+                guest: {
+                    nama_tamu: payload.customGuestName || payload.nama_tamu || 'Demo Guest',
+                    status: status,
+                    konfirmasi_pax: pax,
+                },
+            };
+            // Inject QR INTO theme's success container (bukan overlay) — pakai
+            // MutationObserver karena tiap tema render success state pake selector beda.
+            if (attendsOffline) {
+                observeAndInjectQR(resp.guest.nama_tamu, pax);
+            }
+            return resp;
+        },
+        submit_kontribusi: function (payload) {
+            var modName = moderateMessage(payload.nama_kontributor || '');
+            if (!modName.ok) return { success: false, preview: true, message: 'Nama mengandung kata yang tidak diperbolehkan.', field: 'nama_kontributor' };
+            var modMsg = moderateMessage(payload.pesan || '');
+            if (!modMsg.ok) return { success: false, preview: true, message: modMsg.reason, field: 'pesan' };
+            return {
+                success: true,
+                preview: true,
+                message: 'Kontribusi tercatat! (mode preview — gak disimpan)',
+                jumlah_kontribusi: parseInt(payload.jumlah_kontribusi || 0, 10),
+                kado_id: payload.kado_id,
+            };
+        },
+        submit_contribution: function (payload) {
+            // Alias dari endpoint guest_handler.php (action=submit_contribution)
+            return DUMMY_RESPONSES.submit_kontribusi(payload);
+        },
+        submit_ucapan: function (payload) {
+            var modName = moderateMessage(payload.nama_pengirim || '');
+            if (!modName.ok) return { success: false, preview: true, message: 'Nama mengandung kata yang tidak diperbolehkan.', field: 'nama_pengirim' };
+            var modMsg = moderateMessage(payload.pesan || '');
+            if (!modMsg.ok) return { success: false, preview: true, message: modMsg.reason, field: 'pesan' };
+            return {
+                success: true,
+                preview: true,
+                message: 'Ucapan terkirim! (mode preview — gak disimpan)',
+                ucapan: {
+                    nama_pengirim: payload.nama_pengirim || 'Demo Guest',
+                    pesan: payload.pesan || '',
+                    tanggal_kirim: new Date().toISOString(),
+                },
+            };
+        },
+        get_guest_data: function () {
+            // Generic dummy guest — buat tema yg fetch detail tamu dulu sebelum render form
+            return {
+                success: true,
+                preview: true,
+                guest: {
+                    nama_tamu: 'Tamu Demo',
+                    jumlah_tamu: 2,
+                    konfirmasi_pax: 0,
+                    status: 'Belum Konfirmasi',
+                    tipe_tamu: 'Personal',
+                    kategori: '',
+                },
+            };
+        },
+    };
+
+    // Default fallback response — generic success
+    function defaultDummyResponse(action) {
+        return {
+            success: true,
+            preview: true,
+            message: 'Aksi disimulasi (mode preview)',
+            action: action || 'unknown',
+        };
+    }
+
+    function urlMatchesIntercept(urlStr) {
+        for (var i = 0; i < INTERCEPT_URL_PATTERNS.length; i++) {
+            if (urlStr.indexOf(INTERCEPT_URL_PATTERNS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    function buildResponse(payload, action) {
+        var generator = DUMMY_RESPONSES[action];
+        var data = generator ? generator(payload || {}) : defaultDummyResponse(action);
+        return new Response(JSON.stringify(data), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+        });
+    }
+
+    function parsePayload(options) {
+        if (!options || !options.body) return {};
+        try {
+            if (typeof options.body === 'string') {
+                if (options.body.trim().startsWith('{')) return JSON.parse(options.body);
+                // form-urlencoded → parse to object
+                var p = new URLSearchParams(options.body);
+                var out = {};
+                p.forEach(function (v, k) { out[k] = v; });
+                return out;
+            }
+            if (options.body instanceof FormData) {
+                var fd = {};
+                options.body.forEach(function (v, k) { fd[k] = v; });
+                return fd;
+            }
+        } catch (_) {}
+        return {};
+    }
+
+    // Monkey-patch fetch
+    var origFetch = window.fetch;
+    window.fetch = function (input, init) {
+        var urlStr = typeof input === 'string' ? input : (input && input.url) || '';
+        if (urlStr && urlMatchesIntercept(urlStr)) {
+            var qs = urlStr.indexOf('?') !== -1 ? urlStr.split('?')[1] : '';
+            var action = new URLSearchParams(qs).get('action') || '';
+            var payload = parsePayload(init);
+            // Simulasi network delay (300ms) — fake authenticity
+            return new Promise(function (resolve) {
+                setTimeout(function () {
+                    showPreviewToast();
+                    resolve(buildResponse(payload, action));
+                }, 300);
+            });
+        }
+        return origFetch.apply(this, arguments);
+    };
+
+    // One-time toast notification
+    var toastShown = false;
+    function showPreviewToast() {
+        if (toastShown) return;
+        toastShown = true;
+        var t = document.createElement('div');
+        t.setAttribute('role', 'status');
+        t.style.cssText = [
+            'position:fixed',
+            'top:16px',
+            'left:50%',
+            'transform:translateX(-50%)',
+            'background:#0f172a',
+            'color:#fff',
+            'padding:10px 18px',
+            'border-radius:999px',
+            'font-size:13px',
+            'font-weight:600',
+            'z-index:99999',
+            'box-shadow:0 10px 30px rgba(0,0,0,0.25)',
+            'font-family:-apple-system,BlinkMacSystemFont,"Plus Jakarta Sans",system-ui,sans-serif',
+            'max-width:90vw',
+            'text-align:center',
+            'opacity:0',
+            'transition:opacity .25s',
+        ].join(';');
+        t.textContent = '✨ Mode preview · aksi ini disimulasi (gak disimpan)';
+        document.body.appendChild(t);
+        // Trigger fade-in
+        requestAnimationFrame(function () { t.style.opacity = '1'; });
+        // Auto-dismiss after 3.5s
+        setTimeout(function () {
+            t.style.opacity = '0';
+            setTimeout(function () { t.remove(); }, 300);
+        }, 3500);
+    }
+
+    // === Inline QR injection ke success container tiap tema ===
+    // Setelah RSVP success "Hadir Offline", inject QR card INSIDE existing
+    // success message (bukan full-screen overlay). Tiap tema beda DOM struktur,
+    // jadi pake MutationObserver + multi-selector heuristic.
+    var SUCCESS_SELECTORS = [
+        // ID-based (most specific)
+        '#rsvp-successMessage', '#rsvpSuccess', '#rsvpSuccessMessage', '#successMessage',
+        '#rsvp-success', '#rsvp-success-card', '#successCard',
+        // Class-based
+        '.rsvp-success', '.rsvp-success-card', '.success-rsvp',
+        '.rsvp-thank-you', '.rsvp-confirmed',
+        // Wildcard fallback (last resort)
+        '[id*="rsvp"][id*="success"]',
+        '[id*="rsvp"][id*="confirm"]',
+        '[class*="rsvp-success"]',
+    ];
+
+    function buildInlineQR(guestName, pax) {
+        var qrText = 'PREVIEW-CHECKIN-' + encodeURIComponent(guestName || 'GUEST') + '-' + Date.now();
+        var qrUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + qrText + '&margin=0';
+        var wrap = document.createElement('div');
+        wrap.className = 'chara-preview-rsvp-qr';
+        wrap.setAttribute('data-preview-injected', '1');
+        wrap.style.cssText = [
+            'background:#ffffff',
+            'border:1px dashed #cbd5e1',
+            'border-radius:16px',
+            'padding:18px 16px',
+            'margin:14px auto',
+            'max-width:240px',
+            'text-align:center',
+            'font-family:-apple-system,BlinkMacSystemFont,"Plus Jakarta Sans",system-ui,sans-serif',
+            'box-shadow:0 1px 3px rgba(0,0,0,0.04)',
+        ].join(';');
+        wrap.innerHTML = [
+            '<img src="' + qrUrl + '" alt="QR Check-in Demo" loading="lazy" style="width:180px;height:180px;display:block;margin:0 auto 10px;border-radius:8px;background:#fafafa;" />',
+            '<div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:2px;">' + escapeHtml(guestName || 'Guest') + '</div>',
+            '<div style="font-size:10.5px;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;font-weight:600;">' + pax + ' Pax · Hadir Offline</div>',
+            '<div style="font-size:10.5px;color:#94a3b8;margin-top:10px;line-height:1.45;">Tap di pintu masuk hari-H · QR demo (preview)</div>',
+        ].join('');
+        return wrap;
+    }
+
+    function findSuccessContainer() {
+        for (var i = 0; i < SUCCESS_SELECTORS.length; i++) {
+            var els = document.querySelectorAll(SUCCESS_SELECTORS[i]);
+            for (var j = 0; j < els.length; j++) {
+                var el = els[j];
+                // Element visible (not display:none) + belum di-inject
+                if (el.offsetParent !== null && !el.querySelector('.chara-preview-rsvp-qr')) {
+                    return el;
+                }
+            }
+        }
+        return null;
+    }
+
+    function tryInject(guestName, pax) {
+        var container = findSuccessContainer();
+        if (!container) return false;
+        var qr = buildInlineQR(guestName, pax);
+        // Insert at top of container (above existing content)
+        if (container.firstChild) {
+            container.insertBefore(qr, container.firstChild);
+        } else {
+            container.appendChild(qr);
+        }
+        return true;
+    }
+
+    function observeAndInjectQR(guestName, pax) {
+        // Try immediately (success udah di-render synchronously)
+        if (tryInject(guestName, pax)) return;
+        // Else watch DOM for success container appearing
+        var observer = new MutationObserver(function () {
+            if (tryInject(guestName, pax)) {
+                observer.disconnect();
+            }
+        });
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['style', 'class', 'hidden'],
+        });
+        // Disconnect after 5s (theme didn't render success state)
+        setTimeout(function () { observer.disconnect(); }, 5000);
+    }
+
+    function escapeHtml(str) {
+        return String(str || '').replace(/[&<>"']/g, function (m) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m];
+        });
+    }
+
+    // Sticky watermark badge — hide kalau di iframe (LP punya chip "Live Preview" sendiri),
+    // top-right kalau standalone (avoid collision sama bottom nav theme YT/festival/cinema).
+    // Skip via ?nw=1 URL param (untuk internal recording / marketing asset capture).
+    function injectWatermark() {
+        if (document.getElementById('chara-preview-watermark')) return;
+        // Skip kalau URL ada ?nw=1 (no watermark — internal recording mode)
+        try {
+            var sp = new URLSearchParams(window.location.search);
+            if (sp.get('nw') === '1') return;
+        } catch (e) {}
+        // Skip di iframe — LP context udah ada chip Live Preview di form panel
+        try {
+            if (window.self !== window.top) return;
+        } catch (e) {
+            // Cross-origin iframe error → assume embedded, skip watermark
+            return;
+        }
+        var w = document.createElement('div');
+        w.id = 'chara-preview-watermark';
+        w.style.cssText = [
+            'position:fixed',
+            'top:14px',
+            'right:14px',
+            'background:rgba(15,23,42,0.85)',
+            'color:#fff',
+            'padding:6px 12px',
+            'border-radius:999px',
+            'font-size:11px',
+            'font-weight:700',
+            'letter-spacing:0.04em',
+            'z-index:99998',
+            'pointer-events:none',
+            'font-family:-apple-system,BlinkMacSystemFont,system-ui,sans-serif',
+            'backdrop-filter:blur(6px)',
+            '-webkit-backdrop-filter:blur(6px)',
+        ].join(';');
+        w.textContent = 'PREVIEW MODE';
+        document.body.appendChild(w);
+    }
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', injectWatermark);
+    } else {
+        injectWatermark();
+    }
+
+    console.info('[chara-preview] Active — fetch interceptor + dummy data injection enabled');
+})();
